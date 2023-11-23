@@ -1,0 +1,94 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+Uploading the libraries:
+```{r}
+library(httr)
+library(dplyr)
+library(jsonlite)
+library(utils)
+library(purrr)
+```
+
+API documentation for the POL-on Employee service. This API allows the collection of publicly available POL-on data on academic teachers and persons conducting scientific activities. The list includes people with active employment (the date from and date to the terms of employment of the employee are examined - i.e. active terms of employment must exist on a given day). The data are updated once a day (at night). 
+
+https://radon.nauka.gov.pl/api/katalog-udostepniania-danych/dane-polon/polon/reports_employee
+
+The basic action when using an API is to create queries. The details of the query are determined by used parameters.
+
+We're running the first test query, that's supposed to return 2 pages of results:
+
+```{r}
+initial_req <-
+  httr::GET( url = "https://radon.nauka.gov.pl/opendata/polon/employees", 
+             query = list(resultNumbers = 2)) %>% 
+  httr::content(as = "text", encoding="UTF-8") %>% 
+  jsonlite::fromJSON(flatten =TRUE)
+```
+
+Now we can get the total number of records (maxCount) from the metadata and then calculate, how many requests we need to make to download all of them (one request can download at most 100 records).
+For purpouse of this notebook we're not going to download the whole dataset, but only first 1000 records.
+
+```{r}
+#maxCount <- initial_req[["pagination"]][["maxCount"]]
+maxCount <- 1000
+pages <- round(maxCount / 10,0)
+```
+
+Each request retrieves 10 records. We extract a token from each output and pass it to the next step of the loop.
+
+```{r}
+datalist = list()
+token <- NULL
+pb = txtProgressBar(min = 0, max = pages, initial = 0) 
+
+for(i in 1:pages){
+  
+  response <- httr::GET( url = "https://radon.nauka.gov.pl/opendata/polon/employees",
+                         query = list(resultNumbers = 10,
+                         token = token)) %>% 
+    httr::content(as = "text",
+                  encoding="UTF-8") %>% 
+    jsonlite::fromJSON(flatten = TRUE)
+  
+  token <- response[["pagination"]][["token"]]
+  #print(paste0("Recieved this nextPageToken: ", token))
+  next_resp <- response[["results"]]
+
+  datalist[[i]] <- next_resp
+  
+  setTxtProgressBar(pb,i)
+  
+}
+close(pb)
+```
+
+Now we're going to bind everything into one long dataframe and see what's inside our dataset.
+
+```{r}
+df_employees = do.call(rbind, datalist)
+df_employees[c('personalData.firstName', 'personalData.middleName', 'personalData.lastName', 'calculatedEduLevel')] %>% head(5)
+```
+
+Distribution of degrees in our dataset:
+
+```{r}
+df_employees[c('calculatedEduLevel')] %>% 
+  table() %>%
+  sort(decreasing = TRUE) %>% 
+  barplot(cex.names=0.8,las=2) 
+```
+
+10 most common universities in our dataset.
+
+```{r}
+df_employees[["employeeInInstitutionUuids"]] %>% 
+  map("employingInstitutionName") %>% 
+  unlist() %>%
+  table() %>%
+  sort(decreasing = TRUE) %>%
+  head(10)
+```
+

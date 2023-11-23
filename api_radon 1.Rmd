@@ -1,0 +1,234 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+  html_notebook: default
+  pdf_document: default
+---
+
+
+# Radon API - Podstawy
+
+Notatnik przedstawia proces pobierania danych z platformy Radon za pomocą REST API i przeprowadzania prostych analiz za pomocą języka R oraz kilku podstawowych bibliotek.
+
+Dane dostępne w ramach usługi API są tożsame z tymi dostępnymi pod adresem https://radon.nauka.gov.pl/dane/.
+
+Notatnik stworzony został z myślą o użytkownikach znających język R i ze znikomym doświadczeniem w korzystaniu z API.
+
+W ramach notatnika opisano podstawowe zapytania do API z różnymi parametrami oraz odpowiedzi API, a także przedstawiono proste wizualizacje na danych pobranych z API.
+
+## Przykład I: Pracownicy
+
+API umożliwia pobranie publicznie dostępnych danych na temat nauczycieli akademickich, innych osób prowadzących zajęcia, osób prowadzących działalność naukową oraz osób biorących udział w jej prowadzeniu. Wykaz obejmuje osoby posiadające aktywne zatrudnienie (badane są: data od i data do warunków zatrudnienia pracownika – tzn. na dany dzień muszą istnieć aktywne warunki zatrudnienia). Dane są aktualizowane raz dziennie (w nocy); zwracany jest stan danych POL-on z dnia poprzedniego.
+
+https://radon.nauka.gov.pl/api/katalog-udostepniania-danych/dane-polon/polon/reports_employee
+
+Ładujemy biblioteki:
+
+```{r}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+library(httr)
+library(dplyr)
+library(jsonlite)
+library(utils)
+library(purrr)
+library(rjson)
+library(ggplot2)
+```
+
+### Wstęp do pracy z API i formatem JSON
+
+Podstawową akcją przy korzystaniu z API jest tworzenie zapytań. Szczegóły zapytania są określane przez parametry.
+
+```{r}
+initial_req <-
+  httr::GET( url = "https://radon.nauka.gov.pl/opendata/polon/employees", 
+             query = list(resultNumbers = 2)) %>% 
+  httr::content(as = "text", encoding="UTF-8") %>% 
+  rjson::fromJSON()
+```
+
+Dane są zwracane w formacie json, który zostaje w R przekształcony do postaci listy zagnieżdżonej. Lista ta składa się z uporządkowanych par atrybutów i przyporządkowanych im obiektów (które to obiekty mogą być w szczególności również kolejną listą). Dostęp do wartości uzyskuje się za pomocą nazw atrybutów i pozycji na liście. Na przykład, aby uzyskać dostęp do danych osobowych pierwszego pracownika w odpowiedzi, należy najpierw przejść do „results”, wybrać pierwszą pozycję na liście, a następnie wybrać „personalData”.
+
+```{r}
+initial_req$results[[1]]$personalData
+```
+Przy pomocy parametrów można zawęzić wyniki na przykład do wybranej grupy pracowników. Możliwe parametry można znaleźć w dokumentacji.
+
+```{r}
+req <-
+  httr::GET( url = "https://radon.nauka.gov.pl/opendata/polon/employees", 
+             query = list(firstName = 'Jan', lastName = 'Kowalski')) %>% 
+  httr::content(as = "text", encoding="UTF-8") %>% 
+  rjson::fromJSON()
+
+req$results[[1]]$personalData
+```
+
+```{r}
+req <-
+  httr::GET( url = "https://radon.nauka.gov.pl/opendata/polon/employees", 
+             query = list(disciplineName = 'nauki chemiczne')) %>% 
+  httr::content(as = "text", encoding="UTF-8") %>% 
+  rjson::fromJSON()
+
+req$results[[1]]$employments[[1]]$declaredDisciplines
+```
+
+### Pobranie całego zbioru danych
+
+Podczas jednego odpytania strona zwraca maksymalnie 100 rekordów. Z tego powodu w celu pobrania całego zbioru danych należy odpytać stronę wielokrotnie. Z metadanych wyciągamy całkowitą liczbę rekordów (maxCount) i wyliczamy, ile razy musimy odpytać stronę, żeby pobrać wszystkie dane.
+
+```{r}
+maxCount <- req[["pagination"]][["maxCount"]]
+pages <- round(maxCount / 100,0)
+```
+
+Pobieranie danych – na każdej stronie jest 100 rekordów. Po pobraniu każdej paczki danych wyciągamy z metadanych token pierwszego elementu kolejnej serii i zapisujemy go do zmiennej token. Ten token przekazujemy potem stronie w kolejnym kroku pętli.
+
+```{r}
+datalist = list()
+token <- NULL
+pb = txtProgressBar(min = 0, max = pages, initial = 0) 
+
+for(i in 1:pages){
+  
+  response <- httr::GET( url = "https://radon.nauka.gov.pl/opendata/polon/employees",
+                         query = list(resultNumbers = 100,
+                         token = token,
+                         disciplineName = 'nauki chemiczne')) %>% 
+    httr::content(as = "text",
+                  encoding="UTF-8") %>% 
+    jsonlite::fromJSON(flatten = TRUE)
+  
+  token <- response[["pagination"]][["token"]]
+  datalist[[i]] <- response[["results"]]
+  
+  setTxtProgressBar(pb,i)
+  
+}
+close(pb)
+
+df_employees = do.call(rbind, datalist)
+```
+
+```{r}
+df_employees[c('personalData.firstName', 'personalData.middleName', 'personalData.lastName', 'calculatedEduLevel')] %>% head(5)
+```
+
+Niektóre pola w odpowiedzi, takie jak informacje o zatrudnieniu lub tytule naukowym, są zagnieżdżone. Żeby uzyskać do nich dostęp, należy nieco przekształcić dane.
+
+```{r}
+df_employees_edited <- df_employees %>% 
+  mutate(employinginstituion = df_employees$employeeInInstitutionUuids %>%
+           map('employingInstitutionName') %>%
+           map(., ~paste(., collapse=', ')) %>% 
+           as.character())
+```
+
+Odtworzona tabela z zakładki: https://radon.nauka.gov.pl/dane/nauczyciele-akademiccy-badacze-i-osoby-zaangazowane-w-dzialalnosc-naukowa:
+
+```{r}
+df_employees_edited[c('calculatedEduLevel', 'personalData.firstName', 'personalData.lastName', 'employinginstituion')] %>%
+  `colnames<-`(c("Tytuł/stopień", "Imię", "Nazwisko", "Zatrudnienie")) %>%
+  head(10)
+```
+
+Rozkład najwyższych uzyskanych stopni i tytułów:
+
+```{r}
+df_employees_edited[c('calculatedEduLevel')] %>% 
+  group_by(calculatedEduLevel) %>%
+  summarise(employees = n()) %>%
+  arrange(desc(employees))
+```
+
+```{r}
+df_employees_edited[c('calculatedEduLevel')] %>% 
+  group_by(calculatedEduLevel) %>%
+  summarise(employees = n()) %>%
+  arrange(desc(employees)) %>%
+  ggplot(aes(x=reorder(calculatedEduLevel, -employees), y=employees)) + 
+  geom_bar(stat = "identity", 
+           color = 'grey', 
+           fill = 'lightblue') +
+  theme_minimal() +
+  ylab("Liczebność") +
+  xlab('Najwyższy uzyskany poziom edukacji')
+  
+```
+
+
+## Przykład II - Projekty
+
+API umożliwia pobranie publicznie dostępnych danych na temat projektów obejmujących badania naukowe, prace rozwojowe lub upowszechnianie nauki. Dane pochodzą ze zintegrowanej sieci informacji o nauce i szkolnictwie wyższym POL-on i są aktualizowane raz dziennie (w nocy) – prezentowany jest stan danych POL-on z dnia poprzedniego. Podstawa prawna: Ustawa z dnia 20 lipca 2018 roku – Prawo o szkolnictwie wyższym i nauce.
+
+https://radon.nauka.gov.pl/api/katalog-udostepniania-danych/dane-polon/polon/reports_project
+
+```{r}
+response <- httr::GET( url = "https://radon.nauka.gov.pl/opendata/polon/projects", 
+             query = list(resultNumbers = 2, disciplineName = 'nauki chemiczne')) %>% 
+  httr::content(as = "text", encoding="UTF-8") %>% 
+  jsonlite::fromJSON(flatten =TRUE)
+
+response$results$projectAbstractEn
+```
+
+```{r}
+maxCount <- response[["pagination"]][["maxCount"]]
+pages <- round(maxCount / 100,0)
+
+datalist = list()
+token <- NULL
+pb = txtProgressBar(min = 0, max = pages, initial = 0) 
+
+for(i in 1:pages){
+  
+  response <- httr::GET( url = "https://radon.nauka.gov.pl/opendata/polon/projects",
+                         query = list(resultNumbers = 100,
+                         token = token,
+                         disciplineName = 'nauki chemiczne')) %>% 
+    httr::content(as = "text",
+                  encoding="UTF-8") %>% 
+    jsonlite::fromJSON(flatten = TRUE)
+  
+  token <- response[["pagination"]][["token"]]
+  #print(paste0("Recieved this nextPageToken: ", token))
+  datalist[[i]] <- response[["results"]]
+  
+  setTxtProgressBar(pb,i)
+  
+}
+close(pb)
+
+df_projects = do.call(rbind, datalist)
+```
+
+```{r}
+df_projects[c('projectStartDate', 'projectEndDate', 'projectTitlePl', 'projectTitleEn')] %>% head(5)
+```
+
+```{r}
+df_projects_edited <- df_projects %>% 
+  mutate(projectLength = difftime(projectEndDate, projectStartDate, unit= "days"))
+
+df_projects_edited[c('projectStartDate', 'projectEndDate', 'projectLength', 'projectTitlePl', 'projectTitleEn')] %>% head(5)
+```
+
+```{r}
+hist(as.integer(df_projects_edited$projectLength),
+     breaks = seq(from=0, to=3000, by=180),
+     col = 'lightblue',
+     ylab="Liczebność",
+     xlab='Długość trwania projektu w dniach',
+     main = 'Histogram długości trwania projektów')
+
+abline(v=seq(from=0, to=3000, by=365), 
+       col='red', 
+       lwd=1.5)
+
+legend("topleft", legend = "365 dni", pch = "|",  col = "red")
+
+
+```
